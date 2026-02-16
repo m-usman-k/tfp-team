@@ -2,11 +2,10 @@ import discord
 from discord.ext import commands
 from discord import app_commands
 import traceback
+import datetime
 
-from ext.guild import Guilds
-from ext.tickets import Tickets
-
-ORDER_CATEGORY_ID = 1470838111964758161
+from ext.json_guilds import Guilds
+from ext.json_tickets import Tickets
 
 
 def make_embed(title: str, description: str, color: discord.Color) -> discord.Embed:
@@ -22,16 +21,18 @@ def status_line(status: str) -> str:
 
 
 class OrderView(discord.ui.View):
-    def __init__(self, guilds: Guilds, tickets: Tickets):
+    def __init__(self, guilds: Guilds, tickets: Tickets, admin_cog):
         super().__init__(timeout=None)
         self.guilds = guilds
         self.tickets = tickets
+        self.admin_cog = admin_cog
 
     @discord.ui.button(label="Start Order", style=discord.ButtonStyle.primary, emoji="🧾", custom_id="tfp:create_ticket")
     async def create_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
         if interaction.guild is None:
             embed = make_embed("Heads up", "This can only be used in a server.", discord.Color.orange())
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         guild_data = await self.guilds.get_guild(interaction.guild.id)
@@ -39,27 +40,42 @@ class OrderView(discord.ui.View):
 
         if status == "Closed":
             embed = make_embed(":no_entry: Store closed", "Orders are not available right now.", discord.Color.red())
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         if status == "Paused":
-            await self.guilds.add_notify(interaction.guild.id, interaction.user.id)
             embed = make_embed(
                 "Store paused",
-                "You have been added to the notify list. We will DM you when we reopen.",
+                "Orders are temporarily paused. Press the **Notify Me** button to be alerted when we reopen.",
                 discord.Color.orange(),
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
-        category = interaction.guild.get_channel(ORDER_CATEGORY_ID)
+        # Limit check
+        limit = guild_data.get("ticket_limit", 0)
+        today_count = guild_data.get("tickets_today", 0)
+        
+        # Check for date reset
+        today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        if guild_data.get("last_reset") != today_str:
+            await self.guilds.reset_daily_tickets(interaction.guild.id, today_str)
+            today_count = 0
+            
+        if limit > 0 and today_count >= limit:
+            embed = make_embed(":no_entry: Limit reached", "The daily ticket limit has been reached. Please try again tomorrow.", discord.Color.red())
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        category_id = guild_data.get("category_id")
+        category = interaction.guild.get_channel(category_id)
         if category is None or not isinstance(category, discord.CategoryChannel):
             embed = make_embed(
                 "Missing category",
                 "Order category is missing. Please contact an admin.",
                 discord.Color.red(),
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         overwrites = {
@@ -76,6 +92,10 @@ class OrderView(discord.ui.View):
         )
 
         await self.tickets.insert_ticket(ticket_channel.id, interaction.user.id)
+        await self.guilds.increment_tickets_today(interaction.guild.id)
+
+        # Update panel to reflect new count
+        await self._update_parent_panel(interaction.guild.id)
 
         embed = make_embed(
             ":hamburger: Thanks for opening a ticket!",
@@ -88,7 +108,43 @@ class OrderView(discord.ui.View):
             f"Your ticket has been created: {ticket_channel.mention}",
             discord.Color.green(),
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="Notify Me", style=discord.ButtonStyle.secondary, emoji="🔔", custom_id="tfp:notify_me")
+    async def notify_me(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            guild_data = await self.guilds.get_guild(interaction.guild.id)
+        except:
+            guild_data = {}
+            
+        status = guild_data.get("status", "Closed")
+
+        if status == "Open":
+            embed = make_embed("Store is open", "Orders are currently open! You can start one now.", discord.Color.green())
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        notify_list = guild_data.get("notify", [])
+        if interaction.user.id in notify_list:
+            await self.guilds.remove_notify(interaction.guild.id, interaction.user.id)
+            embed = make_embed(
+                "Notifications removed",
+                "You have been removed from the notify list. You will no longer receive a DM when we reopen.",
+                discord.Color.red(),
+            )
+        else:
+            await self.guilds.add_notify(interaction.guild.id, interaction.user.id)
+            embed = make_embed(
+                "Notification set",
+                "You have been added to the notify list. We will DM you when we reopen.",
+                discord.Color.orange(),
+            )
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    async def _update_parent_panel(self, guild_id: int):
+        guild_data = await self.guilds.get_guild(guild_id)
+        await self.admin_cog._update_order_panel(guild_id, guild_data.get("status", "Closed"))
 
 
 class CloseTicketView(discord.ui.View):
@@ -113,7 +169,7 @@ class Admin(commands.Cog):
         self.bot = bot
         self.guild = Guilds()
         self.tickets = Tickets()
-        self.order_view = OrderView(self.guild, self.tickets)
+        self.order_view = OrderView(self.guild, self.tickets, self)
         self.close_view = CloseTicketView(self.tickets)
 
     async def cog_load(self) -> None:
@@ -126,69 +182,145 @@ class Admin(commands.Cog):
 
     @app_commands.command(name="setup", description="[ADMIN] Sets up the server with the bot")
     async def setup_bot(self, interaction : discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         try:
             if not interaction.user.guild_permissions.administrator:
                 embed = make_embed(":no_entry: Error!", "You need to be an administrator to run this command!", discord.Color.red())
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=True)
                 return
 
             if await self.guild.does_guild_exist(interaction.guild.id):
                 embed = make_embed(":no_entry: Error!", "This server is already setup!", discord.Color.red())
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=True)
                 return
             
-            order_channel = await interaction.guild.create_text_channel("🛒〡order-here")
+            # Create category first
+            category = await interaction.guild.create_category("🛒〡Orders")
+            # Set basic permissions for category
+            await category.set_permissions(interaction.guild.default_role, view_channel=False)
+            await category.set_permissions(interaction.guild.me, view_channel=True, send_messages=True)
 
-            embed = self._order_panel_embed("Closed")
-            message = await order_channel.send(embed=embed, view=OrderView(self.guild, self.tickets))
+            order_channel = await interaction.guild.create_text_channel("🛒〡order-here", category=category)
+            # Allow everyone to see the order channel
+            await order_channel.set_permissions(interaction.guild.default_role, view_channel=True, send_messages=False)
 
-            await self.guild.insert_guild(interaction.guild.id, order_channel.id, message.id)
-            embed = make_embed("Setup complete", "Order channel and button are ready.", discord.Color.green())
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            embed = await self._order_panel_embed(interaction.guild.id, "Closed")
+            message = await order_channel.send(embed=embed, view=OrderView(self.guild, self.tickets, self))
+
+            await self.guild.insert_guild(interaction.guild.id, order_channel.id, message.id, category.id)
+            # Re-update the panel to handle button visibility if it was open (though it starts Closed)
+            await self._update_order_panel(interaction.guild.id, "Closed")
+            embed = make_embed("Setup complete", "Orders category, channel and button are ready.", discord.Color.green())
+            await interaction.followup.send(embed=embed, ephemeral=True)
         except:
             traceback.print_exc()
 
-    @app_commands.command(name="pause", description="[ADMIN] Pause order creation")
-    async def pause_store(self, interaction: discord.Interaction):
+    @app_commands.command(name="limit", description="[ADMIN] Set daily ticket limit (0 for unlimited)")
+    @app_commands.describe(amount="The maximum number of tickets allowed per day (0 for no limit)")
+    async def set_limit(self, interaction: discord.Interaction, amount: int):
+        await interaction.response.defer(ephemeral=True)
         if not interaction.user.guild_permissions.administrator:
             embed = make_embed(":no_entry: Error!", "You need to be an administrator to run this command!", discord.Color.red())
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        if amount < 0:
+            embed = make_embed(":no_entry: Error!", "Limit cannot be negative!", discord.Color.red())
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        await self.guild.set_ticket_limit(interaction.guild.id, amount)
+        guild_data = await self.guild.get_guild(interaction.guild.id)
+        await self._update_order_panel(interaction.guild.id, guild_data.get("status", "Closed"))
+        
+        limit_text = f"{amount}" if amount > 0 else "None (Unlimited)"
+        embed = make_embed("Limit updated", f"Daily ticket limit set to: **{limit_text}**", discord.Color.green())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="settoday", description="[ADMIN] Set current ticket count for today")
+    @app_commands.describe(amount="The current number of tickets created today")
+    async def set_today_count(self, interaction: discord.Interaction, amount: int):
+        await interaction.response.defer(ephemeral=True)
+        if not interaction.user.guild_permissions.administrator:
+            embed = make_embed(":no_entry: Error!", "You need to be an administrator to run this command!", discord.Color.red())
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        if amount < 0:
+            embed = make_embed(":no_entry: Error!", "Count cannot be negative!", discord.Color.red())
+            await interaction.followup.send(embed=embed, ephemeral=True)
+            return
+
+        await self.guild.set_tickets_today(interaction.guild.id, amount)
+        guild_data = await self.guild.get_guild(interaction.guild.id)
+        await self._update_order_panel(interaction.guild.id, guild_data.get("status", "Closed"))
+        
+        embed = make_embed("Count updated", f"Tickets created today set to: **{amount}**", discord.Color.green())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="help", description="Displays the available command list")
+    async def help_command(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        description = (
+            "Here are all the available commands:\n\n"
+            "**Admin Commands**\n"
+            "`/setup` – Setup the server with the initial ticket panel\n"
+            "`/limit <amount>` – Set daily ticket limit (0 for unlimited)\n"
+            "`/settoday <amount>` – Set current ticket count for today\n"
+            "`/pause` – Pause new order creation\n"
+            "`/open` – Open order creation and notify users\n"
+            "`/unpause` – Re-open order creation and notify users\n"
+            "`/close` – Completely close order creation\n"
+            "`/help` – Displays this help message"
+        )
+        embed = discord.Embed(description=description, color=discord.Color.blurple())
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(name="pause", description="[ADMIN] Pause new order creation")
+    async def pause_store(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if not interaction.user.guild_permissions.administrator:
+            embed = make_embed(":no_entry: Error!", "You need to be an administrator to run this command!", discord.Color.red())
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         await self.guild.update_status(interaction.guild.id, "Paused")
         await self._update_order_panel(interaction.guild.id, "Paused")
         embed = make_embed("Store paused", "Users will be added to the notify list.", discord.Color.orange())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     @app_commands.command(name="open", description="[ADMIN] Open order creation and notify users")
     async def open_store(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         if not interaction.user.guild_permissions.administrator:
             embed = make_embed(":no_entry: Error!", "You need to be an administrator to run this command!", discord.Color.red())
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         await self._open_and_notify(interaction)
 
     @app_commands.command(name="unpause", description="[ADMIN] Re-open order creation and notify users")
     async def unpause_store(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         if not interaction.user.guild_permissions.administrator:
             embed = make_embed(":no_entry: Error!", "You need to be an administrator to run this command!", discord.Color.red())
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         await self._open_and_notify(interaction)
 
-    @app_commands.command(name="close", description="[ADMIN] Close order creation")
+    @app_commands.command(name="close", description="[ADMIN] Completely close order creation")
     async def close_store(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         if not interaction.user.guild_permissions.administrator:
             embed = make_embed(":no_entry: Error!", "You need to be an administrator to run this command!", discord.Color.red())
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
 
         await self.guild.update_status(interaction.guild.id, "Closed")
         await self._update_order_panel(interaction.guild.id, "Closed")
         embed = make_embed("Store closed", "Orders are now closed.", discord.Color.red())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     async def _open_and_notify(self, interaction: discord.Interaction):
         guild_data = await self.guild.get_guild(interaction.guild.id)
@@ -197,7 +329,7 @@ class Admin(commands.Cog):
         await self.guild.update_status(interaction.guild.id, "Open")
         await self._update_order_panel(interaction.guild.id, "Open")
         embed = make_embed("Store open", "The store can now accept orders!", discord.Color.green())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
         for user_id in notify_list:
             user = interaction.guild.get_member(user_id)
@@ -215,11 +347,35 @@ class Admin(commands.Cog):
 
         await self.guild.clear_notifies(interaction.guild.id)
 
-    def _order_panel_embed(self, status: str) -> discord.Embed:
+    async def _order_panel_embed(self, guild_id: int, status: str) -> discord.Embed:
+        try:
+            guild_data = await self.guild.get_guild(guild_id)
+        except:
+            guild_data = {}
+        
+        limit = guild_data.get("ticket_limit", 0)
+        today_count = guild_data.get("tickets_today", 0)
+        
+        # Check for date reset
+        today_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        if guild_data and guild_data.get("last_reset") != today_str:
+            # Only reset if the guild actually exists in the DB to avoid setup errors
+            if await self.guild.does_guild_exist(guild_id):
+                await self.guild.reset_daily_tickets(guild_id, today_str)
+                today_count = 0
+            else:
+                today_count = 0
+
+        limit_info = ""
+        if limit > 0:
+            remaining = max(0, limit - today_count)
+            limit_info = f"\n\n**Tickets Remaining:** {remaining}:{limit}"
+
         description = (
             "Tap the button below to open a private order ticket.\n"
             "Subtotal Requirement: $20-$25\nFOR BEST PRICE: $20-21 subtotal\n\n"
             f"**Store status:** {status_line(status)}"
+            f"{limit_info}"
         )
         return make_embed(":shopping_cart: Discounted UE DELIVERY orders!", description, discord.Color.blurple())
 
@@ -233,11 +389,18 @@ class Admin(commands.Cog):
 
             channel = self.bot.get_channel(channel_id)
             if channel is None:
+                channel = await self.bot.fetch_channel(channel_id)
+            if channel is None:
                 return
 
             message = await channel.fetch_message(message_id)
-            embed = self._order_panel_embed(status)
-            await message.edit(embed=embed)
+            embed = await self._order_panel_embed(guild_id, status)
+            
+            view = OrderView(self.guild, self.tickets, self)
+            if status == "Open":
+                view.remove_item(view.notify_me)
+            
+            await message.edit(embed=embed, view=view)
         except:
             traceback.print_exc()
     

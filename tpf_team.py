@@ -16,6 +16,7 @@ client = commands.Bot(command_prefix=prefix, case_insensitive=True, intents=inte
 async def on_ready():
     await client.change_presence(status=discord.Status.online, activity=discord.Activity(type=discord.ActivityType.watching, name="Food orders"))
     print("Logged in!")
+    await client.tree.sync()
 
 @client.command()
 async def sync(ctx) -> None:

@@ -1,0 +1,2 @@
+# Ignore JSON data files (they will be created at runtime)
+*.json
